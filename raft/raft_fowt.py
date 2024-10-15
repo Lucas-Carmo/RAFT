@@ -117,6 +117,7 @@ class FOWT():
         self.g         = getFromDict(design['site'], 'g'        , default=9.81)
         self.shearExp_water = getFromDict(design['site'], 'shearExp_water', default=0.12)
         
+        self.structSolve = getFromDict(design['platform'], 'structSolve', dtype=bool, default=False)
         self.potModMaster = getFromDict(design['platform'], 'potModMaster', dtype=int, default=0)
         dlsMax       = getFromDict(design['platform'], 'dlsMax'      , default=5.0)
         min_freq_BEM = getFromDict(design['platform'], 'min_freq_BEM', default=self.dw/2/np.pi)
@@ -127,6 +128,28 @@ class FOWT():
 
         # member-based platform description
         self.memberList = []                                         # list of member objects
+
+        self.joints = {}  # Dictionary to store joint information
+        if 'joints' in design['platform'].keys():
+            for ji in design['platform']['joints']:
+                jointID = ji[0]
+                jointPos = np.array(ji[1:4])
+                jointType = ji[7]
+
+                self.joints[jointID] = {
+                    'position': jointPos,
+                    'type': jointType,
+                    'heading': None, # Need headings and id_beforeRotation for cases with multiple headings
+                    'id_beforeRotation': jointID
+                }
+
+        # Check if all member ends correspond to a joint if solving for multibody/structural dynamics
+        if self.structSolve:
+            for mi in design['platform']['members']:
+                if mi['rA'] not in self.joints.keys():
+                    raise Exception(f"Joint rA of element {mi['name']} not found in joint list")
+                if mi['rB'] not in self.joints.keys():
+                    raise Exception(f"Joint rB of element {mi['name']} not found in joint list")
 
         for mi in design['platform']['members']:
 
@@ -144,10 +167,12 @@ class FOWT():
             
             # create member object
             if np.isscalar(headings):
-                self.memberList.append(Member(mi, self.nw, heading=headings+heading_adjust))
+                self.applyHeadingToJoints(mi, headings) # Apply headings to joints corresponding to this member if they exit. This function creates new joints if needed.
+                self.memberList.append(Member(mi, self.nw, heading=headings+heading_adjust, joints=self.joints))
             else:
                 for heading in headings:
-                    self.memberList.append(Member(mi, self.nw, heading=heading+heading_adjust))
+                    self.applyHeadingToJoints(mi, heading)
+                    self.memberList.append(Member(mi, self.nw, heading=heading+heading_adjust, joints=self.joints))
         
         
         # add tower(s) and nacelle(s) to member list if applicable
@@ -258,7 +283,62 @@ class FOWT():
         if 'outFolderQTF' in design['platform']:
             self.outFolderQTF = design['platform']['outFolderQTF']
     
+    def applyHeadingToJoints(self, mi, heading):
+        """Apply heading to the joints in the self.joints dictionary.
+        This involves creating new joints and avoiding duplicate joints.
+        """
+        # Loop joints that correspond to the ends of member mi
+        for joint_key in ['rA', 'rB']:
+            jointID = mi[joint_key]
+
+            # Check if mi[joint_key] is the ID of a joint. It might be
+            # the coordinates of the node, which means that the member end
+            # does not correspond to a joint.
+            if not isinstance(jointID, int):
+                continue
+
+            # Need the ID of the joint that was specified in the input file 
+            base_joint_ID = self.joints[jointID]['id_beforeRotation']
+
+            # We check if there is a joint with both ['heading'] = heading and ['id_beforeRotation'] == jointID
+            # In that case, we update the joint id
+            jointList = [k for k in self.joints.keys() if self.joints[k]['heading']==heading and self.joints[k]['id_beforeRotation']==base_joint_ID]
+            if len(jointList)==1:
+                mi[joint_key] = jointList[0]
+                continue
+            elif len(jointList) > 1:
+                raise Exception(f'Found more than one joint with heading {heading} and base id {base_joint_ID}')       
+            base_joint_info = self.joints[base_joint_ID] # Get joint information
+            
+            # If the joint is at (x, y) = (0, 0), it is the same for any heading
+            # and we don't want to create overlapping joints
+            if np.allclose(base_joint_info['position'][:2], [0, 0]):
+                continue
+
+            # If this is the first time applying heading to this joint, we keep the same
+            # ID and update the heading.
+            if base_joint_info['heading'] is None:
+                base_joint_info['heading'] = heading
+                base_joint_info['position'] = applyHeadingToPoint(base_joint_info['position'], heading)
+
+            # If the joint exists and has the required heading for some reason, then we don't need to do anything.
+            # Do we ever fall in this if?
+            elif base_joint_info['heading'] == heading:
+                continue
     
+            # If this is a new heading for this joint (and not the first time applying a heading), we add a new
+            # joint with the required heading. 
+            else:
+                new_jointID = max(self.joints.keys()) + 1
+                new_joint_info = {
+                    'position': applyHeadingToPoint(base_joint_info['position'], heading - base_joint_info['heading']), # Need to subtract the first heading that was applied to the joint
+                    'type': base_joint_info['type'],
+                    'heading': heading,
+                    'id_beforeRotation': base_joint_ID
+                }
+                self.joints[new_jointID] = new_joint_info
+                mi[joint_key] = new_jointID
+
     def setPosition(self, r6):
         '''Updates the FOWT's (mean) position including all components.
         

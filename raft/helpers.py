@@ -1354,9 +1354,16 @@ def cleanRAFTdict(design):
             newdesign[key] = value
         
     return newdesign
+
+def applyHeadingToPoint(r, heading=0):
+    '''Rotate a point with respect to the global Z axis'''
+    if heading == 0.0:
+        return r
     
-
-
+    c = np.cos(np.deg2rad(heading))
+    s = np.sin(np.deg2rad(heading))
+    rotMat = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    return np.matmul(rotMat, r)
 
 if __name__ == '__main__':
     

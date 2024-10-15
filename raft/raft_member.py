@@ -13,7 +13,7 @@ from scipy.special import jn, yn, jv, kn, hankel1
 #  used during the model's operation.
 class Member:
 
-    def __init__(self, mi, nw, BEM=[], heading=0):
+    def __init__(self, mi, nw, BEM=[], heading=0, joints=None):
         '''Initialize a Member. For now, this function accepts a space-delimited string with all member properties.
 
         PARAMETERS
@@ -26,6 +26,10 @@ class Member:
         heading : float, optional
             Heading rotation to apply to the coordinates when setting up the 
             member. Used for member arrangements or FOWT heading offsets [deg].
+        joints: dict
+            Dictionary with joint information
+                joint[ID]['position']: X, Y, Z coordinates of joint
+                joint[ID]['type']: type of joint ('cantilevered', 'pinned', ...)
 
         '''
 
@@ -33,9 +37,25 @@ class Member:
         self.id    = int(1)                                          # set the ID value of the member
         self.name  = str(mi['name'])
         self.type  = int(mi['type'])                                 # set the type of the member (for now, just arbitrary numbers: 0,1,2, etc.)
+        self.joints = joints                                         # Store joint information at member level for easy access
 
-        self.rA0 = np.array(mi['rA'], dtype=np.double)               # [x,y,z] coordinates of lower node relative to PRP [m]
-        self.rB0 = np.array(mi['rB'], dtype=np.double)               # [x,y,z] coordinates of upper node relative to PRP [m]
+        # mi['rA'] can be the coordinate of the node, given as a list, or the ID of a joint
+        if isinstance(mi['rA'], int):
+            self.rA_jointID = mi['rA']
+            self.rA0 = self.joints[self.rA_jointID]['position']  # Position from joint ID
+        else:
+            self.rA_jointID = None
+            self.rA0 = np.array(mi['rA'], dtype=np.double)  # [x,y,z] coordinates of lower node relative to PRP [m]
+            
+
+        if isinstance(mi['rB'], int):
+            self.rB_jointID = mi['rB']
+            self.rB0 = self.joints[self.rB_jointID]['position']  # Position from joint ID
+        else:
+            self.rB_jointID = None
+            self.rB0 = np.array(mi['rB'], dtype=np.double)   # [x,y,z] coordinates of upper node relative to PRP [m]
+            
+
         if (self.rA0[2] == 0 or self.rB0[2] == 0) and self.type != 3:
             raise ValueError("RAFT Members cannot start or end on the waterplane")
         if self.rB0[2] < self.rA0[2]:
@@ -54,15 +74,14 @@ class Member:
     
         # heading feature for rotation members about the z axis (used for rotated patterns)
         if heading != 0.0:
-            c = np.cos(np.deg2rad(heading))
-            s = np.sin(np.deg2rad(heading))
-            rotMat = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-            self.rA0 = np.matmul(rotMat, self.rA0)
-            self.rB0 = np.matmul(rotMat, self.rB0)
+            # If position from joints, they were already rotated
+            if self.rA_jointID is None:
+                self.rA0 = applyHeadingToPoint(self.rA0, heading)
+            if self.rB_jointID is None:
+                self.rB0 = applyHeadingToPoint(self.rB0, heading)
             
             if rAB[0] == 0.0 and rAB[1] == 0:  # special case of vertical member
                 self.gamma += heading  # heading must be applied as twist about z
-
 
         # ----- process station positions and other distributed inputs -----
         
