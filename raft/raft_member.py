@@ -1223,6 +1223,305 @@ class Member:
         
         return F
 
+    def calcCurrentLoads(self, depth, speed=0, heading=0, Zref=0, shearExp_water=0.12, rho=1025, g=9.81, r_ref=np.zeros(3)):
+        '''method to calculate the "static" current loads on each member and save as a current force
+        Uses a simple power law relationship to calculate the current velocity as a function of member node depth
+        
+        Parameters
+        ----------
+        depth: float
+            Water depth [m]
+        speed: float
+            Current speed [m/s]
+        heading: float
+            Current heading from global X (rotates about global Z) [deg]
+        Zref: float
+            Reference z elevation for current profile (at the sea surface by default) [m]
+        shearExp_water: float
+            Exponent for current profile [-]
+        rho: float
+            Water density [kg/m^3]
+        g: float
+            Gravitational acceleration [m/s^2]
+        r_ref: size-3 vector
+            Reference point coordinates to compute current loads [m].
+
+        Returns:
+        D_hydro: 6x1 array
+            Mean current force and moment on the member in global coordinates wrp to r_ref [N, N-m]
+        '''
+        D_hydro = np.zeros(6)
+
+        circ = self.shape=='circular'  # convenience boolian for circular vs. rectangular cross sections
+
+        # loop through each node of the member
+        for il in range(self.ns):
+
+            # only process hydrodynamics if this node is submerged
+            if self.r[il,2] < 0:
+
+                # calculate current velocity as a function of node depth [x,y,z] (assumes no vertical current velocity)
+                v = speed * ((depth - abs(self.r[il,2]))/(depth + Zref))**shearExp_water
+                #v = speed
+                vcur = np.array([v*np.cos(np.deg2rad(heading)), v*np.sin(np.deg2rad(heading)), 0])
+
+                # interpolate coefficients for the current strip
+                Cd_q   = np.interp( self.ls[il], self.stations, self.Cd_q  )
+                Cd_p1  = np.interp( self.ls[il], self.stations, self.Cd_p1 )
+                Cd_p2  = np.interp( self.ls[il], self.stations, self.Cd_p2 )
+                Cd_End = np.interp( self.ls[il], self.stations, self.Cd_End)
+
+                # current (relative) velocity over node (no complex numbers bc not function of frequency)
+                vrel = np.array(vcur)
+                # break out velocity components in each direction relative to member orientation
+                vrel_q  = np.sum(vrel*self.q[:] )*self.q[:]
+                vrel_p  = vrel-vrel_q 
+                vrel_p1 = np.sum(vrel*self.p1[:])*self.p1[:]
+                vrel_p2 = np.sum(vrel*self.p2[:])*self.p2[:]
+                
+                # ----- compute side effects ------------------------
+
+                # member acting area assigned to this node in each direction
+                a_i_q  = np.pi*self.ds[il]*self.dls[il]  if circ else  2*(self.ds[il,0]+self.ds[il,0])*self.dls[il]
+                a_i_p1 =       self.ds[il]*self.dls[il]  if circ else             self.ds[il,0]      *self.dls[il]
+                a_i_p2 =       self.ds[il]*self.dls[il]  if circ else             self.ds[il,1]      *self.dls[il]
+
+                # calculate drag force wrt to each orientation using simple Morison's drag equation
+                Dq = 0.5 * rho * a_i_q * Cd_q * np.linalg.norm(vrel_q) * vrel_q
+
+                if circ: # Use the norm of the total perpendicular relative velocity
+                    normVrel_p1 = np.linalg.norm(vrel_p)
+                    normVrel_p2 = normVrel_p1
+                else: # Otherwise treat each direction separately
+                    normVrel_p1 = np.linalg.norm(vrel_p1)
+                    normVrel_p2 = np.linalg.norm(vrel_p2)
+                Dp1 = 0.5 * rho * a_i_p1 * Cd_p1 * normVrel_p1 * vrel_p1
+                Dp2 = 0.5 * rho * a_i_p2 * Cd_p2 * normVrel_p2 * vrel_p2
+                
+                # ----- end/axial effects drag ------
+
+                # end/axial area (removing sign for use as drag)
+                if circ:
+                    a_i_End = np.abs(np.pi*self.ds[il]*self.drs[il])
+                else:
+                    a_i_End = np.abs((self.ds[il,0]+self.drs[il,0])*(self.ds[il,1]+self.drs[il,1]) - (self.ds[il,0]-self.drs[il,0])*(self.ds[il,1]-self.drs[il,1]))
+                
+                Dq_End = 0.5 * rho * a_i_End * Cd_End * np.linalg.norm(vrel_q) * vrel_q
+
+                # ----- sum forces and add to total mean drag load about PRP ------
+                D = Dq + Dp1 + Dp2 + Dq_End     # sum drag forces at node in member's local orientation frame
+
+                D_hydro += translateForce3to6DOF(D, self.r[il,:] - r_ref)  # sum as forces and moments about PRP
+        return D_hydro
+
+    def computeWaveKinematics(self, zeta, beta, w, k, depth, rho=1025, g=9.81):
+        '''
+        Get wave kinematics (velocity, acceleration, and dynamic pressure) at member nodes given a certain wave condition
+        Because it uses the position of the member nodes, this function accounts for phasing due to the FOWT's mean offset position in the array.      
+        Parameters
+        ----------
+        zeta: [nWaves x nw] float array - nWaves: number of wave headings; nw: number of frequencies
+            Amplitude of each wave component [m]
+        beta: nWaves float array
+            Wave headings [rad]
+        w: nw float array
+            Wave frequencies [rad/s]
+        k: nw float array
+            Wave numbers [1/m] (related to w by the dispersion relation, but faster to pass it instead of recalculating)
+        depth: float
+            Water depth [m]
+        rho: float
+            Water density [kg/m^3]
+        g: float
+            Gravitational acceleration [m/s^2]        
+
+        Returns
+        ----------
+        Does not return anything. This function updates self.u, self.ud, and self.pDyn for each node of the member.
+        Updated these internal functions is required by other functions.
+        '''
+        nWaves    = zeta.shape[0]
+        nw        = len(w)
+        self.u    = np.zeros([nWaves, self.ns, 3, nw], dtype=complex)
+        self.ud   = np.zeros([nWaves, self.ns, 3, nw], dtype=complex)
+        self.pDyn = np.zeros([nWaves, self.ns,    nw], dtype=complex)
+
+        for il in range(self.ns):
+            if self.r[il,2]<0:
+                for ih in range(nWaves):
+                    self.u[ih,il,:,:], self.ud[ih,il,:,:], self.pDyn[ih,il,:] = getWaveKin(zeta[ih,:], beta[ih], w, k, depth, self.r[il,:], nw, rho=rho, g=g)
+
+
+    def calcHydroExcitation(self, r_ref=np.zeros(3)):
+        '''
+        Compute strip-theory wave excitation force (inertial part of Morison's equation).
+        Need to call computeWaveKinematics() first to get the wave kinematics at each node.        
+        Because computeWaveKinematics() uses the position of the member nodes, this function accounts for phasing due to the FOWT's mean offset position in the array.
+
+        Parameters
+        ----------
+        r_ref: size-3 vector
+            Reference point coordinates to compute hydrodynamic loads [m].
+        
+        Returns
+        ----------
+        self.F_hydro_iner: [nWaves x 6 x nw] complex array. nWaves: number of wave headings; 6: number of dofs; nw: number of frequencies
+        '''
+        nWaves, _, _, nw = self.ud.shape
+        self.F_hydro_iner = np.zeros([nWaves, 6, nw],dtype=complex) # inertia excitation force/moment complex amplitudes vector [N, N-m]
+
+        # loop through each node of the member
+        for il in range(self.ns):
+
+            # only process hydrodynamics if this node is submerged
+            if self.r[il,2] < 0:
+                if self.potMod == False:
+                    # calculate the linear excitation forces on this node for each wave heading and frequency
+                    for ih in range(nWaves):
+                        for i in range(nw):
+                            if self.MCF:
+                                Imat = self.Imat_MCF[il,:,:, i]
+                            else:
+                                Imat = self.Imat[il,:,:]
+                            F_exc_iner_temp = np.matmul(Imat, self.ud[ih,il,:,i]) + self.pDyn[ih,il,i]*self.a_i[il]*self.q 
+                            
+                            # add the excitation complex amplitude for this heading and frequency to the global excitation vector
+                            self.F_hydro_iner[ih,:,i] += translateForce3to6DOF(F_exc_iner_temp, self.r[il,:] - r_ref) # (about PRP)
+        return self.F_hydro_iner
+
+
+    def calcHydroLinearization(self, w, ih=0, Xi=np.zeros(6), rho=1025, r_ref=np.zeros(3)):
+        '''To be used within the FOWT's dynamics solve iteration method. This calculates the
+        amplitude-dependent linearized coefficients, including the system linearized drag damping matrix, 
+        of this member.
+        
+        Considers only one sea state which is specified by the index ih.        
+        
+        Parameters
+        ----------
+        w: nw float array
+            Wave frequencies [rad/s]
+        ih: int
+            Index of the wave heading to consider for the drag linearization
+        Xi : size-6 complex array
+            response of the FOWT that this member is attached to - displacement and rotation complex amplitudes [m, rad]
+            TODO: Change this to be the response of the member itself
+        rho: float
+            Water density [kg/m^3]
+        r_ref: size-3 vector
+            Reference point coordinates for outputs [m].
+        
+        Returns
+        ----------
+        B_hydro_drag: 6x6 array
+            Hydrodynamic damping matrix from linearized viscous drag [N-s/m, N-s, N-s-m]
+        F_hydro_drag: 6 x nw complex array
+            Excitation force/moment complex amplitude vector [N, N-m]
+
+        This function also updates self.Bmat (size nNodes x 3 x 3) and self.F_exc_drag (size nNodes x 3 x nw)
+        '''
+
+        circ = self.shape=='circular'  # convenience boolian for circular vs. rectangular cross sections
+        nw = len(w)
+        B_hydro_drag = np.zeros([6,6])             # hydrodynamic damping matrix (just linearized viscous drag for now) [N-s/m, N-s, N-s-m]
+        F_hydro_drag = np.zeros([6, nw],dtype=complex) # excitation force/moment complex amplitudes vector [N, N-m]
+
+        # loop through each node of the member
+        for il in range(self.ns):
+
+            # get node complex velocity amplitude based on platform motion's and relative position from PRP
+            # node displacement, velocity, and acceleration (each [3 x nw])
+            drnode, vnode, anode = getKinematics(self.r[il,:] - r_ref, Xi, w)
+
+            # only process hydrodynamics if this node is submerged
+            if self.r[il,2] < 0:
+
+                # interpolate coefficients for the current strip
+                Cd_q   = np.interp( self.ls[il], self.stations, self.Cd_q  )
+                Cd_p1  = np.interp( self.ls[il], self.stations, self.Cd_p1 )
+                Cd_p2  = np.interp( self.ls[il], self.stations, self.Cd_p2 )
+                Cd_End = np.interp( self.ls[il], self.stations, self.Cd_End)
+
+
+                # ----- compute side effects ------------------------
+
+                # member acting area assigned to this node in each direction
+                a_i_q  = np.pi*self.ds[il]*self.dls[il]  if circ else  2*(self.ds[il,0]+self.ds[il,0])*self.dls[il]
+                a_i_p1 =       self.ds[il]*self.dls[il]  if circ else             self.ds[il,0]       *self.dls[il]
+                a_i_p2 =       self.ds[il]*self.dls[il]  if circ else             self.ds[il,1]       *self.dls[il]
+
+                # water relative velocity over node (complex amplitude spectrum)  [3 x nw]
+                vrel = self.u[ih,il,:] - vnode
+
+                # break out velocity components in each direction relative to member orientation [nw]
+                vrel_q  = np.sum(vrel*self.q[ :,None], axis=0)*self.q[ :,None]     # (the ,None is for broadcasting q across all frequencies in vrel)
+                vrel_p  = vrel - vrel_q
+                vrel_p1 = np.sum(vrel*self.p1[:,None], axis=0)*self.p1[:,None]
+                vrel_p2 = np.sum(vrel*self.p2[:,None], axis=0)*self.p2[:,None]
+                
+                # get RMS of relative velocity component magnitudes (real-valued)
+                vRMS_q  = getRMS(vrel_q)
+                if circ: # Use the total perpendicular relative velocity 
+                    vRMS_p1 = getRMS(vrel_p)
+                    vRMS_p2 = vRMS_p1
+                else: # Otherwise treat each direction separately
+                    vRMS_p1 = getRMS(vrel_p1)
+                    vRMS_p2 = getRMS(vrel_p2)
+                
+                # linearized damping coefficients in each direction relative to member orientation [not explicitly frequency dependent...] (this goes into damping matrix)
+                Bprime_q  = np.sqrt(8/np.pi) * vRMS_q  * 0.5*rho * a_i_q  * Cd_q
+                Bprime_p1 = np.sqrt(8/np.pi) * vRMS_p1 * 0.5*rho * a_i_p1 * Cd_p1
+                Bprime_p2 = np.sqrt(8/np.pi) * vRMS_p2 * 0.5*rho * a_i_p2 * Cd_p2
+
+                # form damping matrix for the node based on linearized drag coefficients
+                Bmat_sides = Bprime_q*self.qMat + Bprime_p1*self.p1Mat + Bprime_p2*self.p2Mat 
+
+
+                # ----- add end/axial effects for added mass, drag, and excitation including dynamic pressure ------
+                # note : v_a and a_i work out to zero for non-tapered sections or non-end sections
+
+                # end/axial area (removing sign for use as drag)
+                if circ:
+                    a_i = np.abs(np.pi*self.ds[il]*self.drs[il])
+                else:
+                    a_i = np.abs((self.ds[il,0]+self.drs[il,0])*(self.ds[il,1]+self.drs[il,1]) - (self.ds[il,0]-self.drs[il,0])*(self.ds[il,1]-self.drs[il,1]))
+
+                Bprime_End = np.sqrt(8/np.pi)*vRMS_q*0.5*rho*a_i*Cd_End
+
+                # form damping matrix for the node based on linearized drag coefficients
+                Bmat_end = Bprime_End*self.qMat                                       #
+
+
+                # ----- sum up side and end damping matrices ------
+                
+                self.Bmat[il,:,:] = Bmat_sides + Bmat_end   # store in Member object to be called later to get drag excitation for each wave heading
+
+                B_hydro_drag += translateMatrix3to6DOF(self.Bmat[il,:,:], self.r[il,:] - r_ref)   # add to global damping matrix for Morison members
+
+
+                # ----- calculate wave drag excitation (this may be recalculated later) -----
+
+                for i in range(nw):
+
+                    self.F_exc_drag[il,:,i] = np.matmul(self.Bmat[il,:,:], self.u[ih,il,:,i])   # get local 3d drag excitation force complex amplitude for each frequency [3 x nw]
+
+                    F_hydro_drag[:,i] += translateForce3to6DOF(self.F_exc_drag[il,:,i], self.r[il,:] - r_ref)   # add to global excitation vector (frequency dependent)
+        
+        return B_hydro_drag, F_hydro_drag
+
+    def calcDragExcitation(self, ih, r_ref=np.zeros(3)):
+        nw = self.u.shape[3]
+        F_hydro_drag = np.zeros([6, nw], dtype=complex) # excitation force/moment complex amplitudes vector [N, N-m]
+        for il in range(self.ns):  # loop through each node of the member
+            if self.r[il,2] < 0:   # only process hydrodynamics if this node is submerged
+                for i in range(nw):                    
+                    # get local 3d drag excitation force complex amplitude for each frequency [3 x nw]
+                    self.F_exc_drag[il,:,i] = np.matmul(self.Bmat[il,:,:], self.u[ih,il,:,i])   
+                    
+                    # add to global excitation vector (frequency dependent)
+                    F_hydro_drag[:,i] += translateForce3to6DOF(self.F_exc_drag[il,:,i], self.r[il,:] - r_ref)
+        return F_hydro_drag
+
 
     def getSectionProperties(self, station):
         '''Get member cross sectional area and moments of inertia at a user-
