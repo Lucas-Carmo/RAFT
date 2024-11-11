@@ -1106,6 +1106,190 @@ class Member:
 
         return Cm_p1, Cm_p2
 
+
+    def calcQTF_slenderBody(self, Xi, beta, w, k, depth, rho=1025, g=9.8, verbose=False):
+        nw = len(w)
+        qtf = np.zeros([nw, nw, 6], dtype=complex)
+
+        # Don't do anything if the member is above the water        
+        if self.rA[2] > 0 and self.rB[2] > 0:
+            return qtf            
+
+        # convenience boolian for circular vs. rectangular cross sections
+        circ = self.shape=='circular'
+
+        # Get fluid and body kinematics at each node of the member
+        nodeV           = np.zeros([3, nw, self.ns], dtype=complex)    # Node velocity
+        dr              = np.zeros([3, nw, self.ns], dtype=complex)    # Node displacement
+        u               = np.zeros([3, nw, self.ns], dtype=complex)    # Incident fluid velocity at node
+        grad_u          = np.zeros([3, 3, nw, self.ns], dtype=complex) # Gradient matrix of first-order velocity
+        grad_dudt       = np.zeros([3, 3, nw, self.ns], dtype=complex) # Gradient matrix of first-order acceleration
+        nodeV_axial_rel = np.zeros([nw, self.ns], dtype=complex)       # Node relative axial velocity
+        grad_pres1st    = np.zeros([3, nw, self.ns], dtype=complex)    # Gradient of first order pressure at each node
+        for iNode, r in enumerate(self.r):
+            dr[:,:, iNode], nodeV[:,:, iNode], _ = getKinematics(r, Xi, w)
+            u[:,:, iNode], _, _ = getWaveKin(np.ones(w.shape), beta, w, k, depth, r, nw, rho=rho, g=g)
+
+            for iw in range(nw):
+                grad_u[:, :, iw, iNode]    = getWaveKin_grad_u1(w[iw], k[iw], beta, depth, r)
+                grad_dudt[:, :, iw, iNode] = getWaveKin_grad_dudt(w[iw], k[iw], beta, depth, r)
+                nodeV_axial_rel[iw, iNode] = np.dot(u[:, iw, iNode]-nodeV[:,iw, iNode], self.q)
+                grad_pres1st[:, iw, iNode] = getWaveKin_grad_pres1st(k[iw], beta, depth, r, rho=rho, g=g)
+                                            
+        # Get fluid and body kinematics at the intersection of the member intersection with the water line
+        eta   = np.zeros([nw], dtype=complex)    # Incoming wave elevation
+        eta_r = np.zeros([nw], dtype=complex)    # Relative incoming wave elevation (i.e. wave elevation - vertical body motion)
+        ud_wl = np.zeros([3, nw], dtype=complex) # Incoming wave acceleration
+        dr_wl = np.zeros([3, nw], dtype=complex) # Body displacement at intersection with water line
+        a_wl  = np.zeros([3, nw], dtype=complex) # Body acceleration at intersection with water line
+        if self.r[-1,2] * self.r[0,2] < 0: # Only if the member intersects the water line
+            r_int = self.r[0,:] + (self.r[-1,:] - self.r[0,:]) * (0. - self.r[0,2]) / (self.r[-1,2] - self.r[0,2]) # Intersection point
+            _, ud_wl, eta  = getWaveKin(np.ones(w.shape), beta, w, k, depth, r_int, nw, rho=1, g=1) # getWaveKin actually returns dynamic pressure, so we use unitary rho and g to get the wave elevation
+            dr_wl, _, a_wl = getKinematics(r_int, Xi, w)
+        
+        # Vector with the acceleration of gravity projected along the p1 and p2 axes of the member (which are perpendicular to the member's axis)
+        g_e1 = np.zeros([3, nw], dtype=complex)
+        for iw in range(nw):
+            g_e1[:, iw] = -g * (np.cross(Xi[3:, iw], self.p1)[2] * self.p1 + np.cross(Xi[3:, iw], self.p2)[2] * self.p2)
+
+        # Relative wave elevation
+        eta_r = eta-dr_wl[2,:]
+
+        # Loop through each pair of frequency
+        for i1, (w1, k1) in enumerate(zip(w, k)):
+            if verbose:
+                    print(f"     - Row {i1+1:02d} of {nw:02d}", end='\r')
+            for i2, (w2, k2) in enumerate(zip(w, k)):
+                F_2ndPot = np.zeros(6, dtype='complex') # Force component due to second-order wave potential
+                F_conv   = np.zeros(6, dtype='complex') # Force component due to convective acceleration
+                F_axdv   = np.zeros(6, dtype='complex') # Force component due to Rainey's axial-divergence acceleration
+                F_eta    = np.zeros(6, dtype='complex') # Force component due to the relative wave elevation
+                F_nabla  = np.zeros(6, dtype='complex') # Force component due to body motions within the first-order wave field
+                F_rslb   = np.zeros(6, dtype='complex') # Force component due to Rainey's body rotation term
+
+                # Need to loop only half of the matrix due to symmetry (QTFs are Hermitian matrices)
+                if w2 < w1:
+                    continue
+
+                # loop through each node of the member
+                for il in range(self.ns):
+                    # only process hydrodynamics if this node is submerged
+                    if self.r[il,2] >= 0:
+                        continue
+
+                    # interpolate coefficients for the current strip
+                    Ca_p1  = np.interp( self.ls[il], self.stations, self.Ca_p1 )
+                    Ca_p2  = np.interp( self.ls[il], self.stations, self.Ca_p2 )
+                    Ca_End = np.interp( self.ls[il], self.stations, self.Ca_End)
+
+                    # ----- compute side effects ---------------------------------------------------------
+                    if circ:
+                        v_i = 0.25*np.pi*self.ds[il]**2*self.dls[il]
+                    else:
+                        v_i = self.ds[il,0]*self.ds[il,1]*self.dls[il]  # member volume assigned to this node
+                        
+                    if self.r[il,2] + 0.5*self.dls[il] > 0:    # if member extends out of water              # <<< may want a better appraoch for this...
+                        v_i = v_i * (0.5*self.dls[il] - self.r[il,2]) / self.dls[il]  # scale volume by the portion that is under water
+
+                    # Force component due to second-order wave potential
+                    acc_2ndPot, p_2nd = getWaveKin_pot2ndOrd(w1, w2, k1, k2, beta, beta, depth, self.r[il,:], g=g, rho=rho) # Second-order pressure will be used later
+                    f_2ndPot = rho*v_i * np.matmul((1.+Ca_p1)*self.p1Mat + (1.+Ca_p2)*self.p2Mat, acc_2ndPot)
+
+                    # Force component due to convective acceleration
+                    conv_acc = 0.25 * ( np.matmul(grad_u[:, :, i1, il], np.conj(u[:, i2, il])) + np.matmul(np.conj(grad_u[:, :, i2, il]), u[:, i1, il]) )
+                    f_conv   = rho*v_i * np.matmul((1.+Ca_p1)*self.p1Mat + (1.+Ca_p2)*self.p2Mat, conv_acc)
+
+                    # Force component due to Rainey's axial-divergence acceleration
+                    f_axdv   = rho*v_i * np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, getWaveKin_axdivAcc(w1, w2, k1, k2, beta, beta, depth, self.r[il,:], nodeV[:, i1, il], nodeV[:, i2, il], self.q, g=g))
+                    
+                    # Force component due to body motions within the first-order wave field
+                    acc_nabla = 0.25*np.matmul(np.squeeze(grad_dudt[:, :, i1, il]), np.squeeze(np.conj(dr[:, i2, il]))) + 0.25*np.matmul(np.squeeze(np.conj(grad_dudt[:, :, i2, il])), np.squeeze(dr[:, i1, il]))
+                    f_nabla  = rho*v_i * np.matmul((1.+Ca_p1)*self.p1Mat + (1.+Ca_p2)*self.p2Mat, acc_nabla)
+
+                    # Force component due to Rainey's body rotation term
+                    OMEGA1  = -getH(1j*w1*Xi[3:,i1]) # The alternator matrix is the opposite of what we need, that is why we have a minus sign
+                    OMEGA2  = -getH(1j*w2*Xi[3:,i2])
+                    f_rslb  = -0.25*2*np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, np.matmul(OMEGA1, np.conj(nodeV_axial_rel[i2, il]*self.q)) + np.matmul(np.conj(OMEGA2), nodeV_axial_rel[i1, il]*self.q))
+                    f_rslb *= rho*v_i                                                
+                    
+                    # Rainey load that is only non zero for non-circular cylinders
+                    # TODO: Now that it's working, should be a separate variable and not inside f_rslb
+                    u1_aux  = u[:,i1, il]-nodeV[:,i1, il]
+                    u2_aux  = u[:,i2, il]-nodeV[:,i2, il]
+                    Vmatrix1 = getWaveKin_grad_u1(w1, k1, beta, depth, self.r[il,:]) + OMEGA1
+                    Vmatrix2 = getWaveKin_grad_u1(w2, k2, beta, depth, self.r[il,:]) + OMEGA2
+                    aux      = 0.25*(np.matmul(Vmatrix1, np.conj(np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u2_aux))) + np.matmul(np.conj(Vmatrix2), np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u1_aux)))
+                    aux     -= np.matmul(self.qMat, aux) # remove axial component                            
+                    f_rslb  += rho*v_i * aux
+
+                    # Similar to the one right above, but note that the order of multiplications with matmul is different
+                    u1_aux  -= np.matmul(self.qMat, u1_aux) # remove axial component
+                    u2_aux  -= np.matmul(self.qMat, u2_aux)
+                    aux      = 0.25*(np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, np.matmul(Vmatrix1, np.conj(u2_aux))) + np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, np.matmul(np.conj(Vmatrix2), u1_aux)))
+                    f_rslb  += - rho*v_i * aux
+
+                                                
+                    # ----- axial/end effects  ------
+                    # note : v_i and a_i work out to zero for non-tapered sections or non-end sections
+                    if circ:
+                        v_i = np.pi/12.0 * abs((self.ds[il]+self.drs[il])**3 - (self.ds[il]-self.drs[il])**3)  # volume assigned to this end surface
+                        a_i = np.pi*self.ds[il] * self.drs[il]   # signed end area (positive facing down) = mean diameter of strip * radius change of strip
+                    else:
+                        v_i = np.pi/12.0 * ((np.mean(self.ds[il]+self.drs[il]))**3 - (np.mean(self.ds[il]-self.drs[il]))**3)    # so far just using sphere eqn and taking mean of side lengths as d
+                        a_i = (self.ds[il,0]+self.drs[il,0])*(self.ds[il,1]+self.drs[il,1]) - (self.ds[il,0]-self.drs[il,0])*(self.ds[il,1]-self.drs[il,1])
+                    
+                    f_2ndPot += self.a_i[il]*p_2nd*self.q # 2nd order pressure
+                    f_2ndPot += rho*v_i*Ca_End*np.matmul(self.qMat, acc_2ndPot) # 2nd order axial acceleration
+                    f_conv   += rho*v_i*Ca_End*np.matmul(self.qMat, conv_acc)   # convective acceleration
+                    f_nabla  += rho*v_i*Ca_End*np.matmul(self.qMat, acc_nabla)  # due to body motions within the first-order wave field - acceleration part
+                    p_nabla   = 0.25*np.dot(grad_pres1st[:, i1, il], np.conj(dr[:, i2, il])) + 0.25*np.dot(np.conj(grad_pres1st[:, i2, il]), dr[:, i1, il])
+                    f_nabla  += self.a_i[il]*p_nabla*self.q # due to body motions within the first-order wave field - pressure part
+                    p_drop    = -2*0.25*0.5*rho*np.dot(np.matmul(self.p1Mat + self.p2Mat, u[:,i1, il]-nodeV[:, i1, il]), np.conj(np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u[:,i2, il]-nodeV[:, i2, il])))
+                    f_conv   += self.a_i[il]*p_drop*self.q
+
+                    F_2ndPot += translateForce3to6DOF(f_2ndPot, self.r[il,:])
+                    F_conv   += translateForce3to6DOF(f_conv, self.r[il,:])                   
+                    F_axdv   += translateForce3to6DOF(f_axdv, self.r[il,:])
+                    F_nabla  += translateForce3to6DOF(f_nabla, self.r[il,:])
+                    F_rslb   += translateForce3to6DOF(f_rslb, self.r[il,:])
+                                                    
+                # Force acting at the intersection of the member with the mean waterline
+                f_eta = np.zeros(3, dtype=complex)
+                F_eta = np.zeros(6, dtype=complex)
+                if self.r[-1,2] * self.r[0,2] < 0:
+                    # Need just the cross section area, as the length along the cylinder is the relative wave elevation
+                    # Get the area of the cross section at the mean waterline
+                    i_wl = np.where(self.r[:,2] < 0)[0][-1] # find index of self.r[:,2] that is right before crossing 0
+                    if circ:
+                        if i_wl != len(self.ds)-1:
+                            d_wl = 0.5*(self.ds[i_wl]+self.ds[i_wl+1])
+                        else:
+                            d_wl = self.ds[i_wl]
+                        a_i = 0.25*np.pi*d_wl**2
+                    else:
+                        if i_wl != len(self.ds)-1:
+                            d1_wl = 0.5*(self.ds[i_wl,0]+self.ds[i_wl+1,0])
+                            d2_wl = 0.5*(self.ds[i_wl,1]+self.ds[i_wl+1,1])
+                        else:
+                            d1_wl = self.ds[i_wl, 0]
+                            d2_wl = self.ds[i_wl, 1]
+                        a_i = d1_wl*d2_wl
+
+                    f_eta = 0.25*((ud_wl[:,i1])*np.conj(eta_r[i2])+np.conj((ud_wl[:,i2]))*eta_r[i1]) # Product between incoming wave acceleration and relative wave elevation
+                    f_eta = rho*a_i*np.matmul((1.+Ca_p1)*self.p1Mat + (1.+Ca_p2)*self.p2Mat, f_eta) # Project in the correct directions (and scale by the area and density)
+                    a_eta = 0.25*((a_wl[:,i1])*np.conj(eta_r[i2])+np.conj((a_wl[:,i2]))*eta_r[i1])  # Product between body acceleration and relative wave elevation
+                    f_eta -= rho*a_i*np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, a_eta) # Project in the correct directions (and scale by the area and density)
+                    f_eta -= 0.25*rho*a_i * (g_e1[:,i1]*np.conj(eta_r[i2])+np.conj(g_e1[:,i2])*eta_r[i1]) # Add hydrostatic term
+
+                    F_eta = translateForce3to6DOF(f_eta, r_int) # Load vector in 6 DOF 
+                
+                # Total contribution to this frequency pair of the QTF due to the current member
+                qtf[i1, i2, :] += F_2ndPot + F_axdv + F_conv + F_nabla + F_eta + F_rslb
+
+                # Add Kim and Yue correction                                                     
+                qtf[i1, i2, :] += self.correction_KAY(depth, w1, w2, beta, rho=rho, g=g, k1=k1, k2=k2, Nm=10)        
+        return qtf
+
     def correction_KAY(self, h, w1, w2, beta, rho=1025, g=9.81, k1=None, k2=None, Nm=10):
         '''For surface-piercing vertical cylinders, we can partially account for second-order diffraction loads
            by using the analytical solution for a bottom-mounted, surface-piercing, vertical cylinder. 
