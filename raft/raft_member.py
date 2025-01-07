@@ -1235,15 +1235,15 @@ class Member:
                     f_rslb  += - rho*v_i * aux
 
                                                 
-                    # ----- axial/end effects  ------
+
+                    # ----- end effects  ------                               
                     # note : v_i and a_i work out to zero for non-tapered sections or non-end sections
+                    # TODO: Should probably skip this part if along the length of the element, i.e. if a_i and v_i are different from zero due to tapering
                     if circ:
                         v_i = np.pi/12.0 * abs((self.ds[il]+self.drs[il])**3 - (self.ds[il]-self.drs[il])**3)  # volume assigned to this end surface
-                        a_i = np.pi*self.ds[il] * self.drs[il]   # signed end area (positive facing down) = mean diameter of strip * radius change of strip
                     else:
                         v_i = np.pi/12.0 * ((np.mean(self.ds[il]+self.drs[il]))**3 - (np.mean(self.ds[il]-self.drs[il]))**3)    # so far just using sphere eqn and taking mean of side lengths as d
-                        a_i = (self.ds[il,0]+self.drs[il,0])*(self.ds[il,1]+self.drs[il,1]) - (self.ds[il,0]-self.drs[il,0])*(self.ds[il,1]-self.drs[il,1])
-                    
+
                     f_2ndPot += self.a_i[il]*p_2nd*self.q # 2nd order pressure
                     f_2ndPot += rho*v_i*Ca_End*np.matmul(self.qMat, acc_2ndPot) # 2nd order axial acceleration
                     f_conv   += rho*v_i*Ca_End*np.matmul(self.qMat, conv_acc)   # convective acceleration
@@ -1252,6 +1252,11 @@ class Member:
                     f_nabla  += self.a_i[il]*p_nabla*self.q # due to body motions within the first-order wave field - pressure part
                     p_drop    = -2*0.25*0.5*rho*np.dot(np.matmul(self.p1Mat + self.p2Mat, u[:,i1, il]-nodeV[:, i1, il]), np.conj(np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u[:,i2, il]-nodeV[:, i2, il])))
                     f_conv   += self.a_i[il]*p_drop*self.q
+
+                    u1_aux    = np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u1_aux)
+                    u2_aux    = np.matmul(Ca_p1*self.p1Mat + Ca_p2*self.p2Mat, u2_aux)
+                    f_transv  = 0.25*self.a_i[il]*rho*(np.conj(u1_aux)*nodeV_axial_rel[i2, il] + u2_aux*np.conj(nodeV_axial_rel[i1, il]))
+                    f_conv   += f_transv                    
 
                     F_2ndPot += translateForce3to6DOF(f_2ndPot, self.r[il,:])
                     F_conv   += translateForce3to6DOF(f_conv, self.r[il,:])                   
